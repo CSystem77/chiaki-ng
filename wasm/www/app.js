@@ -290,7 +290,6 @@ let retryingConnect = false;
 let sessionGate = null;
 let sessionStopping = false;
 let confirmDone = null;
-let registSearchFailed = false;
 
 const canvas = $("video");
 const ctx2d = canvas.getContext("2d");
@@ -4680,13 +4679,9 @@ function syncWakeButton(card, v) {
 		const host = v.h;
 		wake.onclick = async (ev) => {
 			ev.stopPropagation();
-			const wasmOk = await ensureWasmRuntime();
-			if (!wasmOk || typeof api.wakeup !== "function") {
-				log(t("log.wasmFailed"), 0);
-				return;
-			}
+			await ensureWasmRuntime();
 			ensureDiscovery();
-			api.wakeup(host.addr, host.registKey, host.ps5 ? 1 : 0);
+			if (api.wakeup) api.wakeup(host.addr, host.registKey, host.ps5 ? 1 : 0);
 			log(t("log.waking"));
 		};
 		actions.appendChild(wake);
@@ -5014,14 +5009,23 @@ function beginHostRename(card, host) {
 	const finish = (save) => {
 		if (input.dataset.done) return;
 		input.dataset.done = "1";
-		if (save) renameHost(host.addr, input.value);
+		// Le champ doit quitter le DOM avant tout rendu : renderHosts() s'abstient tant
+		// qu'un .host-name-input est present. Le nom etait bien enregistre, mais la
+		// carte restait bloquee en edition et toute la liste cessait de se mettre a jour.
+		const value = input.value.trim();
+		if (save && value) nameEl.textContent = value;
+		if (input.isConnected) input.replaceWith(nameEl);
+		lastHostListSig = "";
+		if (save) renameHost(host.addr, value);
 		else renderHosts();
 	};
 	input.onkeydown = (ev) => {
 		ev.stopPropagation();
 		if (ev.key === "Enter") {
 			ev.preventDefault();
-			input.blur();
+			// Valider directement : passer par blur() ne fait rien si le champ a deja
+			// perdu le focus, et Entree semblait alors sans effet.
+			finish(true);
 		} else if (ev.key === "Escape") {
 			ev.preventDefault();
 			finish(false);
@@ -5092,6 +5096,10 @@ async function showView(name, opts) {
 	$("welcome-bar").classList.toggle("hidden", name !== "welcome");
 	$("settings-view").classList.toggle("hidden", name !== "settings");
 	$("stream-view").classList.toggle("hidden", name !== "stream");
+	try {
+		if (name === "stream") window.LunarDetect?.onStreamStart();
+		else window.LunarDetect?.onStreamStop();
+	} catch {}
 	syncDocumentTitle();
 	if (name === "stream") {
 		if (opts?.fullscreen !== false) enterStreamFullscreen();
@@ -5783,24 +5791,36 @@ function lookupPsnUsername(username) {
 	return "";
 }
 
-// The register flow used to report everything through log(), which the modal hides.
-// Mirror it into #reg-error so the failure is visible where the user is looking.
-function setRegError(msg, pending) {
+// L'enregistrement n'ecrivait que dans le journal (onglet Config) : toutes les erreurs
+// etaient invisibles depuis la fenetre, d'ou l'impression que le bouton ne fait rien.
+function setRegistMsg(msg, kind) {
 	const el = $("reg-error");
 	if (!el) return;
 	el.textContent = msg || "";
-	el.classList.toggle("pending", !!pending);
 	el.classList.toggle("hidden", !msg);
+	el.classList.toggle("ok", kind === "ok");
 }
 
-function regFail(key, vars) {
-	const msg = vars ? t(key, vars) : t(key);
-	log(msg, 0);
-	setRegError(msg);
+let registBusyTimer = 0;
+
+function setRegistBusy(busy) {
+	const btn = $("reg-ok");
+	clearTimeout(registBusyTimer);
+	if (btn) {
+		btn.disabled = !!busy;
+		btn.textContent = t(busy ? "regist.running" : "regist.ok");
+	}
+	if (!busy) return;
+	registBusyTimer = setTimeout(() => {
+		setRegistBusy(false);
+		setRegistMsg(t("regist.errTimeout"));
+		log(t("regist.errTimeout"), 0);
+	}, 45000);
 }
 
 function openRegist(host) {
-	setRegError("");
+	setRegistMsg("");
+	setRegistBusy(false);
 	$("reg-host").value = host.addr || "";
 	$("reg-host").dataset.real = host.addr || "";
 	$("reg-pin").value = "";
@@ -5938,6 +5958,14 @@ async function testAddHostPorts() {
 		out.innerHTML = `<p class="portcheck-sum bad">${escapeHtml(t("add.portcheckBad"))}</p>`;
 		return;
 	}
+	// L'application Electron tourne sur le reseau local de la console : le test direct
+	// fonctionne, contrairement au service heberge qui ne voit pas les adresses privees.
+	if (isPrivateIpv4(host) && !cloud.homeProxy && !isElectronApp()) {
+		out.classList.remove("hidden");
+		const key = cloud.homeProxyPending ? "add.portcheckNeedApprove" : "add.portcheckNeedHome";
+		out.innerHTML = `<p class="portcheck-sum bad">${escapeHtml(t(key))}</p>`;
+		return;
+	}
 	btn.disabled = true;
 	const prev = btn.textContent;
 	btn.textContent = t("add.portcheckRun");
@@ -5961,10 +5989,11 @@ async function testAddHostPorts() {
 		const tcp = body.ports.find((p) => p.port === 9295 && p.proto === "tcp");
 		const tcpOk = !!(tcp && tcp.status === "open") || body.ok === true;
 		const viaHome = body.via === "home" || cloud.homeProxy;
+		const viaLocal = body.via === "local";
 		const sumClass = tcpOk ? "ok" : "bad";
 		const sum = tcpOk
-			? t(viaHome ? "add.portcheckOkHome" : "add.portcheckOk")
-			: t(viaHome ? "add.portcheckWarnHome" : "add.portcheckWarn");
+			? t(viaHome ? "add.portcheckOkHome" : (viaLocal ? "add.portcheckOkLocal" : "add.portcheckOk"))
+			: t(viaHome ? "add.portcheckWarnHome" : (viaLocal ? "add.portcheckWarnLocal" : "add.portcheckWarn"));
 		out.innerHTML = `<p class="portcheck-sum ${sumClass}">${escapeHtml(sum)}</p>`;
 		if (tcpOk) {
 			addPortcheckOk = true;
@@ -6303,39 +6332,49 @@ function bindUi() {
 		$("add-modal").classList.add("hidden");
 	};
 
-	$("reg-cancel").onclick = () => { setRegError(""); $("regist-modal").classList.add("hidden"); };
+	$("reg-cancel").onclick = () => {
+		setRegistBusy(false);
+		setRegistMsg("");
+		$("regist-modal").classList.add("hidden");
+	};
 	$("reg-lookup").onclick = () => lookupPsnUsername($("reg-psn-user").value);
 	$("btn-psn-lookup").onclick = () => lookupPsnUsername($("s-psn-user").value);
 	$("reg-ok").onclick = async () => {
+		const fail = (key) => {
+			const msg = t(key);
+			setRegistMsg(msg);
+			log(msg, 0);
+		};
+		setRegistMsg("");
 		const pin = Number($("reg-pin").value);
-		if (!pin) return regFail("log.pinRequired");
+		if (!pin) return fail("log.pinRequired");
 		const ps5 = Number($("regist-modal").dataset.ps5);
 		const host = ($("reg-host").dataset.real || $("reg-host").value).trim();
 		const psnId = normalizePsnAccountId($("reg-psn").value || psnIdForHost({ addr: host }));
 		if (ps5 && !psnIdLooksValid(psnId)) {
-			regFail("log.psnHint");
+			fail("log.psnHint");
 			$("psn-regist-fields").classList.remove("hidden");
 			$("reg-psn").focus();
 			return;
 		}
-		if (looksLikeIpv6(host)) {
-			regFail("log.registIpv6");
-			return;
-		}
+		if (looksLikeIpv6(host)) return fail("log.registIpv6");
 		if (psnId) upsertHostPsn(host, psnId, { name: $("regist-modal").dataset.name, ps5 });
 		if (host && !isPrivateIpv4(host)) log(t("log.registLanHint"), 0);
-		setRegError(t("log.wasmLoading"), true);
-		const wasmOk = await ensureWasmRuntime();
-		if (!wasmOk || typeof api.regist !== "function") {
-			regFail("log.wasmFailed");
-			return;
+		setRegistBusy(true);
+		let ready = false;
+		try { ready = await ensureWasmRuntime(); }
+		catch { ready = false; }
+		if (!ready || typeof api.regist !== "function") {
+			setRegistBusy(false);
+			return fail("regist.errRuntime");
 		}
-		registSearchFailed = false;
-		if (api.regist(host, pin, psnId, ps5, 0) !== 0) {
-			regFail("log.registFailed", { error: "start" });
-			return;
+		const rc = api.regist(host, pin, psnId, ps5, 0);
+		if (rc !== 0) {
+			setRegistBusy(false);
+			const msg = t("log.registFailed", { error: "code " + rc });
+			setRegistMsg(msg);
+			log(msg, 0);
 		}
-		setRegError(t("log.registRunning"), true);
 	};
 
 	$("home-proxy-approve")?.addEventListener("click", () => approveHomeProxy());
@@ -6562,8 +6601,6 @@ function bindModule() {
 	};
 	Module.onLog = (level, msg) => {
 		if (shouldSuppressConnectLog(msg)) return;
-		if (/Regist (search failed|timed out waiting for search response)/i.test(String(msg || "")))
-			registSearchFailed = true;
 		log(msg, level);
 	};
 	Module.onHost = addDiscovered;
@@ -6620,15 +6657,11 @@ function bindModule() {
 		}
 	};
 	Module.onRegist = (info) => {
+		setRegistBusy(false);
 		if (!info.ok) {
-			log(t("log.registFailed", { error: info.error || "" }), 0);
-			if (registSearchFailed) {
-				log(t("log.registSearchFail"), 0);
-				setRegError(t("log.registSearchFail"));
-			} else {
-				setRegError(t("log.registFailed", { error: info.error || "" }));
-			}
-			return;
+			const msg = t("log.registFailed", { error: info.error || "" });
+			setRegistMsg(msg);
+			return log(msg, 0);
 		}
 		const host = ($("reg-host").dataset.real || $("reg-host").value).trim();
 		rememberHost({
@@ -6639,7 +6672,7 @@ function bindModule() {
 			morning: info.morning,
 			psnId: normalizePsnAccountId($("reg-psn")?.value || "")
 		});
-		setRegError("");
+		setRegistMsg("");
 		$("regist-modal").classList.add("hidden");
 		log(t("log.registered", { name: info.nickname }));
 	};
@@ -6716,23 +6749,27 @@ async function startWasmRuntime() {
 	proxyState = "";
 	refreshProxyStatus();
 	log("Init Chiaki WASM → " + proxyUrl);
-	let initRc = -1;
+	let initRc;
 	try {
 		initRc = api.init(proxyUrl);
 	} catch (e) {
-		log("WASM init: " + (e && e.message ? e.message : e), 0);
-	}
-	if (initRc !== 0) {
+		const abort = window.__chiakiWasmAbort ? " / " + String(window.__chiakiWasmAbort) : "";
+		log(t("log.wasmInitCrash", { error: (e && e.message) ? e.message : String(e) }) + abort, 0);
 		proxyState = "failed";
 		refreshProxyStatus();
-		log(t("log.wasmFailed"), 0);
+		return false;
+	}
+	if (initRc !== 0) {
+		log(t("log.wasmInitFailed", { code: initRc }), 0);
+		proxyState = "failed";
+		refreshProxyStatus();
 		return false;
 	}
 	try {
 		await waitFor(() => api.netReady() === 1, 8000);
 		proxyState = "connected";
 		refreshProxyStatus();
-		if (cloud.homeProxy || isElectronApp()) startDiscovery();
+		if (cloud.homeProxy) startDiscovery();
 	} catch {
 		proxyState = "offline";
 		refreshProxyStatus();
@@ -6746,9 +6783,11 @@ function ensureWasmRuntime() {
 		wasmReadyP = startWasmRuntime().then((ok) => {
 			if (!ok) wasmReadyP = null;
 			return ok;
-		}, (err) => {
+		}).catch((e) => {
+			// Une trappe dans le module WASM rejette la promesse. Sans remise a zero,
+			// elle reste memorisee et toutes les tentatives suivantes echouent dessus.
 			wasmReadyP = null;
-			log("WASM: " + (err && err.message ? err.message : err), 0);
+			log("WASM: " + (e && e.message ? e.message : String(e)), 0);
 			return false;
 		});
 	}
@@ -6757,7 +6796,7 @@ function ensureWasmRuntime() {
 
 function scheduleWasmWarmup() {
 	const kick = () => {
-		if (cloud.homeProxyPending && !isElectronApp()) return;
+		if (cloud.homeProxyPending) return;
 		ensureWasmRuntime().catch(() => {});
 	};
 	const onFirstInput = () => {
